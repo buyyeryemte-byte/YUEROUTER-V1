@@ -1,6 +1,6 @@
 import { HTTP_STATUS, RETRY_CONFIG, DEFAULT_RETRY_CONFIG, resolveRetryEntry, FETCH_CONNECT_TIMEOUT_MS } from "../config/runtimeConfig.js";
 import { shouldRefreshCredentials } from "../services/oauthCredentialManager.js";
-import { proxyAwareFetch } from "../utils/proxyFetch.js";
+import { proxyAwareFetch, looksLikeRelayUrl } from "../utils/proxyFetch.js";
 import { dbg } from "../utils/debugLog.js";
 import { ANTHROPIC_API_VERSION, OPENAI_COMPAT_BASE, ANTHROPIC_COMPAT_BASE } from "../providers/shared.js";
 import { resolveOpenAICompatibleApiType } from "../services/provider.js";
@@ -75,6 +75,17 @@ export class BaseExecutor {
     return headers;
   }
 
+  // Relay egress IPs are shared by many users, so upstream free quotas are
+  // often bound to the relay egress: the same request returns 429 via relay
+  // but 200 direct (observed with opencode free models). Detect either an
+  // explicit relay URL or a relay URL sitting in standard proxy fields
+  // (promoted to the relay path inside proxyAwareFetch).
+  wentViaRelay(proxyOptions) {
+    if (!proxyOptions) return false;
+    if (proxyOptions.vercelRelayUrl && String(proxyOptions.vercelRelayUrl).trim()) return true;
+    return looksLikeRelayUrl(proxyOptions.connectionProxyUrl || proxyOptions.url);
+  }
+
   // Override in subclass for provider-specific transformations
   transformRequest(model, body, stream, credentials) {
     return body;
@@ -143,13 +154,38 @@ export class BaseExecutor {
         const bodyStr = JSON.stringify(transformedBody);
         const fetchT0 = Date.now();
         dbg("FETCH", `${this.provider.toUpperCase()} → ${url} | body=${bodyStr.length}B | connectTimeout=${timeoutMs}ms`);
-        const response = await proxyAwareFetch(url, {
+        let response = await proxyAwareFetch(url, {
           method: "POST",
           headers,
           body: bodyStr,
           signal: mergedSignal
         }, proxyOptions);
         clearTimeout(connectTimer);
+
+        // Relay egress IPs are shared, so a 429 via relay often means the
+        // relay's egress quota is exhausted while the caller's own IP still
+        // has quota (opencode free: 429 via relay, 200 direct). Fail over to
+        // one direct attempt instead of surfacing the relay's 429 — never
+        // when strictProxy forbids leaving via the direct IP.
+        if (response.status === HTTP_STATUS.RATE_LIMITED
+          && this.wentViaRelay(proxyOptions)
+          && proxyOptions?.strictProxy !== true) {
+          log?.warn?.("RELAY", `${this.provider.toUpperCase()} | 429 via relay, retrying direct once`);
+          try {
+            const directRes = await proxyAwareFetch(url, {
+              method: "POST",
+              headers,
+              body: bodyStr,
+              signal: mergedSignal,
+            }, null);
+            try { await response.body?.cancel?.(); } catch { /* drop relay body */ }
+            response = directRes;
+            dbg("FETCH", `${this.provider.toUpperCase()} ← direct ${response.status} (relay failover)`);
+          } catch (directErr) {
+            if (directErr?.name === "AbortError") throw directErr;
+            log?.debug?.("RELAY", `direct retry failed (${directErr?.message}), keeping relay response`);
+          }
+        }
         const ct = response.headers?.get?.("content-type") || "";
         const cl = response.headers?.get?.("content-length") || "?";
         dbg("FETCH", `${this.provider.toUpperCase()} ← ${response.status} | ttft=${Date.now() - fetchT0}ms | ct=${ct} | cl=${cl}`);

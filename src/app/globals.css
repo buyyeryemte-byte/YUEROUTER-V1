@@ -8,7 +8,7 @@
 .fonts-loaded .material-symbols-outlined { opacity: 1; transition: opacity .12s ease-out; }
 
 /* ============================================================
-   9Router palette — adopted from 9remote_private/web
+   Yuerouter palette — forked from 9Router, brand coral scale
    Brand orange (dark) / soft coral (light), neutral warm bases
    ============================================================ */
 :root {

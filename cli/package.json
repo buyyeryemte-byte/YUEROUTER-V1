@@ -1,9 +1,9 @@
 {
-  "name": "9router",
-  "version": "0.5.95",
-  "description": "9Router CLI - Start and manage 9Router server",
+  "name": "yuerouter",
+  "version": "1.0.0",
+  "description": "Yuerouter CLI - Start and manage Yuerouter server",
   "bin": {
-    "9router": "./cli.js"
+    "yuerouter": "./cli.js"
   },
   "files": [
     "cli.js",

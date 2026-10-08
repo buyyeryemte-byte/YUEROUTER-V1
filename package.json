@@ -1,6 +1,6 @@
 {
   "name": "yuerouter",
-  "version": "0.5.95",
+  "version": "1.0.0",
   "description": "Yuerouter web dashboard (9Router-compatible)",
   "private": true,
   "scripts": {

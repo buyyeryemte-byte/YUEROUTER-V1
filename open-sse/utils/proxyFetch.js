@@ -132,6 +132,35 @@ function normalizeString(value) {
 }
 
 /**
+ * Relay endpoints (Vercel / Cloudflare Workers / Deno) are plain HTTPS
+ * forwarders — they are NOT HTTP forward proxies. Feeding one to undici's
+ * ProxyAgent makes every request fail with a bare "fetch failed" (observed
+ * with pool URLs like https://vercel-relay-*.vercel.app saved as a standard
+ * proxy). Detect them so they are routed via relay headers instead.
+ */
+const RELAY_HOST_SUFFIXES = [".vercel.app", ".workers.dev", ".deno.dev", ".deno.net"];
+
+export function looksLikeRelayUrl(value) {
+  try {
+    const host = new URL(normalizeString(value)).hostname.toLowerCase();
+    return RELAY_HOST_SUFFIXES.some((s) => host === s.slice(1) || host.endsWith(s));
+  } catch {
+    return false;
+  }
+}
+
+/** Flatten "fetch failed" + undici cause chain into one loggable line. */
+function errText(err) {
+  const base = err?.message || String(err);
+  const cause = err?.cause;
+  if (!cause) return base;
+  const detail = typeof cause === "object"
+    ? (cause.message || cause.code || JSON.stringify(cause))
+    : String(cause);
+  return detail && detail !== base ? `${base} (cause: ${detail})` : base;
+}
+
+/**
  * Resolve real IP using Google DNS (bypass system DNS)
  */
 async function resolveRealIP(hostname) {
@@ -333,7 +362,19 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
   const targetUrl = typeof url === "string" ? url : url.toString();
 
   // Vercel relay: forward request via relay headers
-  const vercelRelayUrl = normalizeString(proxyOptions?.vercelRelayUrl);
+  let vercelRelayUrl = normalizeString(proxyOptions?.vercelRelayUrl);
+  const connectionProxyUrl = resolveConnectionProxyUrl(targetUrl, proxyOptions);
+  const envProxyUrl = connectionProxyUrl ? null : normalizeProxyUrl(getEnvProxyUrl(targetUrl));
+  let proxyUrl = connectionProxyUrl || envProxyUrl;
+
+  // A relay endpoint saved as a standard proxy (wrong pool type, or legacy
+  // connection fields holding a relay URL) would fail 100% of the time
+  // inside ProxyAgent. Promote it to the relay path instead of failing.
+  if (!vercelRelayUrl && proxyUrl && looksLikeRelayUrl(proxyUrl)) {
+    vercelRelayUrl = normalizeProxyUrl(proxyUrl);
+    proxyUrl = null;
+  }
+
   if (vercelRelayUrl) {
     const parsed = new URL(targetUrl);
     const baseHeaders = options.headers instanceof Headers
@@ -344,12 +385,16 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
       "x-relay-target": `${parsed.protocol}//${parsed.host}`,
       "x-relay-path": `${parsed.pathname}${parsed.search}`,
     };
-    return originalFetch(vercelRelayUrl, { ...options, headers: relayHeaders });
+    try {
+      return await originalFetch(vercelRelayUrl, { ...options, headers: relayHeaders });
+    } catch (relayError) {
+      if (proxyOptions?.strictProxy === true) {
+        throw new Error(`[ProxyFetch] Relay required but failed (strictProxy=true): ${errText(relayError)}`);
+      }
+      console.warn(`[ProxyFetch] Relay failed, falling back to direct: ${errText(relayError)}`);
+      return fetchWithTlsFallback(url, options, null);
+    }
   }
-
-  const connectionProxyUrl = resolveConnectionProxyUrl(targetUrl, proxyOptions);
-  const envProxyUrl = connectionProxyUrl ? null : normalizeProxyUrl(getEnvProxyUrl(targetUrl));
-  const proxyUrl = connectionProxyUrl || envProxyUrl;
 
   // MITM DNS bypass: for known MITM-intercepted hosts, resolve real IP to avoid DNS spoof
   if (shouldBypassMitmDns(targetUrl)) {
@@ -359,9 +404,9 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
         return await fetchWithTlsFallback(url, options, proxyUrl);
       } catch (proxyError) {
         if (proxyOptions?.strictProxy === true) {
-          throw new Error(`[ProxyFetch] Proxy required but failed (strictProxy=true): ${proxyError.message}`);
+          throw new Error(`[ProxyFetch] Proxy required but failed (strictProxy=true): ${errText(proxyError)}`);
         }
-        console.warn(`[ProxyFetch] Proxy failed, falling back to direct bypass: ${proxyError.message}`);
+        console.warn(`[ProxyFetch] Proxy failed, falling back to direct bypass: ${errText(proxyError)}`);
       }
     }
     // No proxy — manually resolve real IP to bypass DNS spoof
@@ -380,9 +425,9 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
     } catch (proxyError) {
       // If strictProxy is enabled, fail hard instead of falling back to direct
       if (proxyOptions?.strictProxy === true) {
-        throw new Error(`[ProxyFetch] Proxy required but failed (strictProxy=true): ${proxyError.message}`);
+        throw new Error(`[ProxyFetch] Proxy required but failed (strictProxy=true): ${errText(proxyError)}`);
       }
-      console.warn(`[ProxyFetch] Proxy failed, falling back to direct: ${proxyError.message}`);
+      console.warn(`[ProxyFetch] Proxy failed, falling back to direct: ${errText(proxyError)}`);
       return fetchWithTlsFallback(url, options, null);
     }
   }

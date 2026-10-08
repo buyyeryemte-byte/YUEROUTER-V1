@@ -33,6 +33,23 @@ export function pickProxyPoolId(poolIds, strategy, providerId) {
   return poolIds[0]; // "none" or unknown
 }
 
+// Relay endpoints (Vercel / Cloudflare Workers / Deno) are plain HTTPS
+// forwarders, not HTTP forward proxies. If one is saved with a standard pool
+// type (or in legacy connection fields), ProxyAgent fails every request with
+// a bare "fetch failed". Detect by host so config mistakes route correctly.
+// (Same heuristic as looksLikeRelayUrl in open-sse/utils/proxyFetch.js —
+// duplicated here to keep the src bundle independent of open-sse.)
+const RELAY_HOST_SUFFIXES = [".vercel.app", ".workers.dev", ".deno.dev", ".deno.net"];
+
+function looksLikeRelayUrl(value) {
+  try {
+    const host = new URL(normalizeString(value)).hostname.toLowerCase();
+    return RELAY_HOST_SUFFIXES.some((s) => host === s.slice(1) || host.endsWith(s));
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Normalize legacy proxy configuration.
  */
@@ -104,9 +121,12 @@ export async function resolveConnectionProxyConfig(
       if (isValidPool) {
         /**
          * Vercel/Cloudflare relay proxies use base URL rewriting
-         * instead of HTTP_PROXY environment variables.
+         * instead of HTTP_PROXY environment variables. The type check is
+         * widened by host: a relay URL saved under a standard pool type
+         * must still take the relay path, otherwise every request fails
+         * inside ProxyAgent ("fetch failed") and silently falls back.
          */
-        if (proxyPool.type === "vercel" || proxyPool.type === "cloudflare" || proxyPool.type === "deno") {
+        if (proxyPool.type === "vercel" || proxyPool.type === "cloudflare" || proxyPool.type === "deno" || looksLikeRelayUrl(proxyUrl)) {
           return {
             source: proxyPool.type,
 
@@ -150,6 +170,24 @@ export async function resolveConnectionProxyConfig(
       legacy.connectionProxyEnabled &&
       legacy.connectionProxyUrl
     ) {
+      // A relay URL stored in legacy fields is not an HTTP proxy either —
+      // expose it as the relay URL so it takes the relay-headers path.
+      if (looksLikeRelayUrl(legacy.connectionProxyUrl)) {
+        return {
+          source: "legacy-relay",
+
+          proxyPoolId: proxyPoolId || null,
+          proxyPool: null,
+
+          connectionProxyEnabled: false,
+          connectionProxyUrl: "",
+          connectionNoProxy: legacy.connectionNoProxy,
+
+          strictProxy: poolStrictProxy,
+
+          vercelRelayUrl: legacy.connectionProxyUrl,
+        };
+      }
       return {
         source: "legacy",
 
